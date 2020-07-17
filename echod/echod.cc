@@ -102,9 +102,8 @@ private:
 		}
 
 		buffer->bump(written);
-		if (buffer->nbytes() == 0) {
+		if (buffer->nbytes() == 0)
 			write_queue.pop_front();
-		}
 	}
 
 	// Receive message from client socket
@@ -120,10 +119,11 @@ private:
 		if (nread == 0) {
 			// Gack - we're deleting ourself inside of ourself!
 			delete this;
-		} else {
-			// Send message bach to the client
-			write_queue.push_back(std::make_unique<Buffer>(buffer, nread));
+			return;
 		}
+
+		// Send message bach to the client
+		write_queue.push_back(std::make_unique<Buffer>(buffer, nread));
 	}
 
 	// effictivly a close and a destroy
@@ -220,7 +220,7 @@ int EchoInstance::total_clients = 0;
 
 int main(int argc, char **argv)
 {
-	uint16_t port = 8192;
+	uint16_t port = 2222;
 	if (argc > 1)
 		port = atoi(argv[1]);
 
