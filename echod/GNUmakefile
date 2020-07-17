@@ -1,9 +1,13 @@
 PROG = echod
 SRCS = echod.cc
 
-PORT     ?= 1
+PORT     ?= 2222
 
 CXXFLAGS += -g -std=c++17 -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter
+ifneq ($(findstring $(shell uname),FreeBSD),)
+    CXXFLAGS += -I/usr/local/include
+    LDFLAGS += -L/usr/local/lib
+endif
 LDFLAGS  += -lev
 ifneq ($(findstring $(shell uname -m),armv7l),)
     # support my arm32 phone
@@ -23,5 +27,5 @@ run: $(PROG)
 valgrind: $(PROG)
 	valgrind --leak-check=full ./$(PROG) $(PORT)
 
-$(PROG): $(SRCS:.c=.o)
+$(PROG): $(SRCS:.cc=.o)
 	$(CXX) $(CFLAGS) $(TARGET_ARCH) $(OUTPUT_OPTION) $^ $(LDFLAGS)
