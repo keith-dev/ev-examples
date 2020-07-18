@@ -1,4 +1,4 @@
-//	started with: https://gist.github.com/koblas/3364414
+// based on: https://gist.github.com/koblas/3364414
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -14,25 +14,20 @@
 
 #include <list>
 #include <memory>
+#include <utility>
 
 //
 //	Buffer class:	allow for output buffering such that it can be written out
 //					into async pieces
 //
 class Buffer {
-	char*   data;
-	ssize_t len;
-	ssize_t pos;
+	std::unique_ptr<char> data_;
+	ssize_t len_{};
+	ssize_t pos_{};
 
 public:
-	Buffer(const char* bytes, ssize_t nbytes) :
-		data(new char[nbytes]), len(nbytes), pos(0) {
-		memcpy(data, bytes, nbytes);
-	}
-
-	~Buffer() {
-		delete [] data;
-	}
+	Buffer() = default;
+	~Buffer() = default;
 
 	Buffer(const Buffer &) = delete;
 	Buffer& operator=(const Buffer &) = delete;
@@ -40,16 +35,20 @@ public:
 	Buffer(Buffer &) = delete;
 	Buffer& operator=(Buffer &) = delete;
 
+	Buffer(std::unique_ptr<char> data, ssize_t nbytes) :
+		data_(std::move(data)), len_(nbytes) {
+	}
+
 	char *dpos() {
-		return data + pos;
+		return data_.get() + pos_;
 	}
 
 	void bump(ssize_t nbytes) {
-		pos += nbytes;
+		pos_ = std::min(len_, pos_ + nbytes); 
 	}
 
 	ssize_t nbytes() {
-		return len - pos;
+		return len_ - pos_;
 	}
 };
 
@@ -57,14 +56,13 @@ public:
 //   A single instance of a non-blocking Echo handler
 //
 class EchoInstance {
-private:
 	static int total_clients;
-	ev::io	io;
-	int	    sfd;
+	ev::io	io_;
+	int	    sfd_;
 
 	// Buffers that are pending write
 	// need smart pointer because of how we terminate
-	std::list<std::unique_ptr<Buffer>> write_queue;
+	std::list<std::unique_ptr<Buffer>> write_queue_;
 
 	// Generic callback
 	void callback(ev::io &watcher, int revents) {
@@ -79,21 +77,21 @@ private:
 		if (revents & EV_WRITE)
 			write_cb(watcher);
 
-		if (write_queue.empty()) {
-			io.set(ev::READ);
+		if (write_queue_.empty()) {
+			io_.set(ev::READ);
 		} else {
-			io.set(ev::READ|ev::WRITE);
+			io_.set(ev::READ|ev::WRITE);
 		}
 	}
 
 	// Socket is writable
 	void write_cb(ev::io &watcher) {
-		if (write_queue.empty()) {
-			io.set(ev::READ);
+		if (write_queue_.empty()) {
+			io_.set(ev::READ);
 			return;
 		}
 
-		Buffer* buffer = write_queue.front().get();
+		Buffer* buffer = write_queue_.front().get();
 
 		ssize_t written = write(watcher.fd, buffer->dpos(), buffer->nbytes());
 		if (written == -1) {
@@ -103,14 +101,15 @@ private:
 
 		buffer->bump(written);
 		if (buffer->nbytes() == 0)
-			write_queue.pop_front();
+			write_queue_.pop_front();
 	}
 
 	// Receive message from client socket
 	void read_cb(ev::io &watcher) {
-		char buffer[4*1024];
+		constexpr size_t buffersz{4*1024};
+		std::unique_ptr<char> buffer{std::make_unique<char>(buffersz)};
 
-		ssize_t nread = recv(watcher.fd, buffer, sizeof(buffer), 0);
+		ssize_t nread = recv(watcher.fd, buffer.get(), buffersz, 0);
 		if (nread == -1) {
 			perror("read error");
 			return;
@@ -123,40 +122,38 @@ private:
 		}
 
 		// Send message bach to the client
-		write_queue.push_back(std::make_unique<Buffer>(buffer, nread));
+		write_queue_.push_back(std::make_unique<Buffer>(std::move(buffer), nread));
 	}
 
-	// effictivly a close and a destroy
+	// private because we kill ourselves
 	~EchoInstance() {
 		// Stop and free watcher if client socket is closing
-		io.stop();
+		io_.stop();
 
-		close(sfd);
+		close(sfd_);
 
 		printf("%d client(s) connected.\n", --total_clients);
 	}
 
 public:
-	EchoInstance(int s) : sfd(s) {
-		fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+	EchoInstance(int s) : sfd_(s) {
+		fcntl(sfd_, F_SETFL, fcntl(sfd_, F_GETFL, 0) | O_NONBLOCK);
 
-		printf("Got connection\n");
-		total_clients++;
+		printf("Got connection: %d\n", ++total_clients);
 
-		io.set<EchoInstance, &EchoInstance::callback>(this);
+		io_.set<EchoInstance, &EchoInstance::callback>(this);
 
-		io.start(s, ev::READ);
+		io_.start(sfd_, ev::READ);
 	}
 };
 
 class EchoServer {
-private:
-	ev::io	 io;
-	ev::sig	 sio;
-	int		 s;
+	ev::io	 io_;
+	ev::sig	 sio_;
+	int		 s_{-1};
 
 public:
-	void io_accept(ev::io &watcher, int revents) {
+	void io_accept(ev::io& watcher, int revents) {
 		if (EV_ERROR & revents) {
 			perror("got invalid event");
 			return;
@@ -171,8 +168,8 @@ public:
 			return;
 		}
 
-		// Let them float free and clean up themselves?
-		EchoInstance* client = new EchoInstance(client_sd);
+		// Let them float free and clean up themselves
+		new EchoInstance(client_sd);
 	}
 
 	static void signal_cb(ev::sig &signal, int revents) {
@@ -182,37 +179,39 @@ public:
 	EchoServer(uint16_t port) {
 		printf("Listening on port %d\n", port);
 
-		s = socket(PF_INET, SOCK_STREAM, IPPROTO_IP);
+		s_ = socket(PF_INET, SOCK_STREAM, IPPROTO_IP);
 
 		struct sockaddr_in addr;
 		addr.sin_family = AF_INET;
 		addr.sin_port   = htons(port);
 		addr.sin_addr.s_addr = INADDR_ANY;
 
-		if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+		if (bind(s_, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
 			perror("bind");
 		}
 
-		fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+		fcntl(s_, F_SETFL, fcntl(s_, F_GETFL, 0) | O_NONBLOCK);
 
-		listen(s, 5);
+		struct linger sl;
+		sl.l_onoff = 1;         /* non-zero value enables linger option in kernel */
+		sl.l_linger = 0;        /* timeout interval in seconds */
+		setsockopt(s_, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
 
-		io.set<EchoServer, &EchoServer::io_accept>(this);
-		io.start(s, ev::READ);
+		listen(s_, 5);
 
-		sio.set<&EchoServer::signal_cb>();
-		sio.start(SIGINT);
+		io_.set<EchoServer, &EchoServer::io_accept>(this);
+		io_.start(s_, ev::READ);
+
+		sio_.set<&EchoServer::signal_cb>();
+		sio_.start(SIGINT);
 	}
 
 	~EchoServer() {
 		// stop accepting connections
-		shutdown(s, SHUT_RD);
+		shutdown(s_, SHUT_RD);
 
-		// service existing connections
-		sleep(1);
-
-		// we're done
-		close(s);
+		// we're done, don't care about existing connections
+		close(s_);
 	}
 };
 
