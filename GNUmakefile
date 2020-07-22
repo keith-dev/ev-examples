@@ -1,6 +1,6 @@
-SUBDIR = echod
+SUBDIR = echod follow
 
-.PHONY: $(SUBDIR)
+.PHONY: all clean $(SUBDIR)
 
 all: $(SUBDIR)
 

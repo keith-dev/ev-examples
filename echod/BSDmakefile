@@ -1,0 +1,9 @@
+PROG_CXX = echod
+SRCS     = echod.cc
+MK_MAN   = no
+NO_OBJ   = noobj
+
+CXXFLAGS  = -g
+CXXFLAGS += -std=c++17 -Wall -Wextra
+
+.include <bsd.prog.mk>
