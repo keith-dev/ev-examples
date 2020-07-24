@@ -35,7 +35,8 @@ struct finfo_t
 {
 	finfo_t() = default;
 	~finfo_t() = default;
-	finfo_t(int fd, const char* name);
+	finfo_t(off_t offset, const char* name);
+//	finfo_t(int fd, const char* name);
 
 	finfo_t(finfo_t&& n);
 	finfo_t& operator=(finfo_t&& n) = delete;
@@ -43,14 +44,14 @@ struct finfo_t
 	finfo_t(const finfo_t& n) = delete;
 	finfo_t& operator=(const finfo_t& n) = delete;
 
-	struct aiocb* fill_cb(int kq);
+	struct aiocb* fill_cb(int fd, int kq);
 
 #ifndef NDEBUG
 	void invariant() const;
 #endif
 
 	// file info
-	int fd{-1};
+//	int fd{-1};
 	off_t offset{-1};
 	size_t namelen{std::numeric_limits<size_t>::max()};
 	const char* name{nullptr};
@@ -70,9 +71,11 @@ struct finfo_t
 typedef std::map<int, finfo_t> fileinfo_t;	// files by fd
 typedef std::vector<struct kevent> kevents_t;
 
-finfo_t::finfo_t(int fd, const char* name) :
+finfo_t::finfo_t(off_t offset, const char* name) :
+//finfo_t::finfo_t(int fd, const char* name) :
 	// file info
-	fd(fd), offset(lseek(fd, 0, SEEK_END)), namelen(strlen(name)), name(name),
+	offset(offset), namelen(strlen(name)), name(name),
+//	fd(fd), offset(lseek(fd, 0, SEEK_END)), namelen(strlen(name)), name(name),
 
 	// asynchronous i/o
 #ifndef NDEBUG
@@ -95,7 +98,8 @@ finfo_t::finfo_t(int fd, const char* name) :
 
 finfo_t::finfo_t(finfo_t&& n) :
 	// file info
-	fd(n.fd), offset(n.offset), namelen(n.namelen), name(n.name),
+	offset(n.offset), namelen(n.namelen), name(n.name),
+//	fd(n.fd), offset(n.offset), namelen(n.namelen), name(n.name),
 
 	// prebuilt comment
 	commentsz(n.commentsz), comment(std::move(n.comment)),
@@ -106,7 +110,7 @@ finfo_t::finfo_t(finfo_t&& n) :
 #endif
 	cb(n.cb), buf(std::move(n.buf))
 {
-	n.fd		= -1;
+//	n.fd		= -1;
 	n.name		= nullptr;
 	n.offset	= -1;
 #ifndef NDEBUG
@@ -118,14 +122,14 @@ finfo_t::finfo_t(finfo_t&& n) :
 #ifndef NDEBUG
 void finfo_t::invariant() const
 {
-	assert(fd != -1 || fd >= 0);
+//	assert(fd != -1 || fd >= 0);
 	assert((name == nullptr && namelen == std::numeric_limits<size_t>::max()) || strlen(name) == namelen);
 	assert((comment.get() == nullptr && commentsz == -1) || strlen(comment.get()) == static_cast<size_t>(commentsz));
 	assert((buf == nullptr && bufsz == -1) || (buf.get() && bufsz == FDBUF_SZ));
 }
 #endif
 
-struct aiocb* finfo_t::fill_cb(int kq)
+struct aiocb* finfo_t::fill_cb(int fd, int kq)
 {
 #ifndef NDEBUG
 	invariant();
@@ -153,7 +157,7 @@ fileinfo_t make_fileinfo(int argc, char* argv[])
 		if (fd == -1)
 			err(EXIT_FAILURE, "cannot open: %s", argv[i]);
 
-		files.emplace(fd, finfo_t(fd, argv[i]));
+		files.emplace(fd, finfo_t(lseek(fd, 0, SEEK_END), argv[i]));
 	}
 
 	return files;
@@ -179,7 +183,7 @@ void write(int fd, finfo_t& file, const char* buf, int nbytes)
 	static int lastfd{-1};
 
 	if (nbytes > 0) {
-		if (lastfd != -1 && file.fd != lastfd)
+		if (lastfd != -1 && fd != lastfd)
 			write(fd, file.comment.get(), file.commentsz);
 		
 		int sent{};
@@ -194,7 +198,7 @@ void write(int fd, finfo_t& file, const char* buf, int nbytes)
 		file.offset += nbytes;
 	}
 
-	lastfd = file.fd;
+	lastfd = fd;
 }
 
 //---------------------------------------------------------------------------
@@ -329,7 +333,7 @@ void decode_events(fileinfo_t& files, int kq, int i, const struct kevent& tevent
 #endif
 
 	// add aio_read
-	int ret{  aio_read(file.fill_cb(kq)) };
+	int ret{  aio_read(file.fill_cb(fd, kq)) };
 	trace("aio_read(fd=%d offset=%ld nbytes=%d)=%d code=%d error=\"%s\"\n",
 		fd, file.offset, file.bufsz, ret, errno, strerror(errno));
 	if (ret == 0)
