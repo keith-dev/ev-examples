@@ -27,6 +27,9 @@
 
 #define	FDBUF_SZ	(512 * 1024)
 
+using fd_t = int;
+using kq_t = int;
+
 int trace(const char* fmt, ...) __attribute__ ((format (printf, 1, 2)));
 
 //---------------------------------------------------------------------------
@@ -36,7 +39,6 @@ struct finfo_t
 	finfo_t() = default;
 	~finfo_t() = default;
 	finfo_t(off_t offset, const char* name);
-//	finfo_t(int fd, const char* name);
 
 	finfo_t(finfo_t&& n);
 	finfo_t& operator=(finfo_t&& n) = delete;
@@ -44,14 +46,13 @@ struct finfo_t
 	finfo_t(const finfo_t& n) = delete;
 	finfo_t& operator=(const finfo_t& n) = delete;
 
-	struct aiocb* fill_cb(int fd, int kq);
+	struct aiocb* fill_cb(fd_t fd, kq_t kq);
 
 #ifndef NDEBUG
 	void invariant() const;
 #endif
 
 	// file info
-//	int fd{-1};
 	off_t offset{-1};
 	size_t namelen{std::numeric_limits<size_t>::max()};
 	const char* name{nullptr};
@@ -65,17 +66,18 @@ struct finfo_t
 	bool pending{false};
 #endif
 	struct aiocb cb;
-	inline static constexpr int bufsz{FDBUF_SZ};
+	inline static constexpr size_t bufsz{FDBUF_SZ};
 	std::unique_ptr<char, decltype(&free)> buf{nullptr, free};
 };
-typedef std::map<int, finfo_t> fileinfo_t;	// files by fd
-typedef std::vector<struct kevent> kevents_t;
+using fileinfo_t = std::map<fd_t, finfo_t>;	// files by fd
+using kevents_t = std::vector<struct kevent>;
 
+#ifdef NDEBUG
+inline
+#endif
 finfo_t::finfo_t(off_t offset, const char* name) :
-//finfo_t::finfo_t(int fd, const char* name) :
 	// file info
 	offset(offset), namelen(strlen(name)), name(name),
-//	fd(fd), offset(lseek(fd, 0, SEEK_END)), namelen(strlen(name)), name(name),
 
 	// asynchronous i/o
 #ifndef NDEBUG
@@ -96,10 +98,12 @@ finfo_t::finfo_t(off_t offset, const char* name) :
 #endif
 }
 
+#ifdef NDEBUG
+inline
+#endif
 finfo_t::finfo_t(finfo_t&& n) :
 	// file info
 	offset(n.offset), namelen(n.namelen), name(n.name),
-//	fd(n.fd), offset(n.offset), namelen(n.namelen), name(n.name),
 
 	// prebuilt comment
 	commentsz(n.commentsz), comment(std::move(n.comment)),
@@ -110,7 +114,6 @@ finfo_t::finfo_t(finfo_t&& n) :
 #endif
 	cb(n.cb), buf(std::move(n.buf))
 {
-//	n.fd		= -1;
 	n.name		= nullptr;
 	n.offset	= -1;
 #ifndef NDEBUG
@@ -122,14 +125,16 @@ finfo_t::finfo_t(finfo_t&& n) :
 #ifndef NDEBUG
 void finfo_t::invariant() const
 {
-//	assert(fd != -1 || fd >= 0);
 	assert((name == nullptr && namelen == std::numeric_limits<size_t>::max()) || strlen(name) == namelen);
 	assert((comment.get() == nullptr && commentsz == -1) || strlen(comment.get()) == static_cast<size_t>(commentsz));
-	assert((buf == nullptr && bufsz == -1) || (buf.get() && bufsz == FDBUF_SZ));
+	assert(buf.get() && bufsz == FDBUF_SZ);
 }
 #endif
 
-struct aiocb* finfo_t::fill_cb(int fd, int kq)
+#ifdef NDEBUG
+inline
+#endif
+struct aiocb* finfo_t::fill_cb(fd_t fd, kq_t kq)
 {
 #ifndef NDEBUG
 	invariant();
@@ -153,7 +158,7 @@ fileinfo_t make_fileinfo(int argc, char* argv[])
 	fileinfo_t files;
 
 	for (int i = 1; i < argc; ++i) {
-		int fd = open(argv[i], O_RDONLY);
+		fd_t fd = open(argv[i], O_RDONLY);
 		if (fd == -1)
 			err(EXIT_FAILURE, "cannot open: %s", argv[i]);
 
@@ -171,26 +176,27 @@ kevents_t make_events(fileinfo_t& files)
 	fileinfo_t::iterator p{ files.begin() };
 
 	for (; p != files.end(); ++p, ++i) {
-		int fd = p->first;
+		fd_t fd = p->first;
 		EV_SET(&events[i], fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_WRITE, 0, NULL);
 	}
 
 	return events;
 }
 
-void write(int fd, finfo_t& file, const char* buf, int nbytes)
+ssize_t write(fd_t fd, finfo_t& file, const char* buf, size_t nbytes)
 {
-	static int lastfd{-1};
+	static fd_t lastfd{-1};
+
+	ssize_t sent{};
 
 	if (nbytes > 0) {
 		if (lastfd != -1 && fd != lastfd)
 			write(fd, file.comment.get(), file.commentsz);
 		
-		int sent{};
-		while (sent < nbytes) {
-			int ret = write(fd, buf, nbytes - sent);
+		while (static_cast<size_t>(sent) < nbytes) {
+			ssize_t ret = write(fd, buf, nbytes - sent);
 			if (unlikely(ret == -1))
-				err(EXIT_FAILURE, "write(%d, buf, %d) failed", fd, nbytes - sent);
+				err(EXIT_FAILURE, "write(%d, buf, %ld) failed", fd, nbytes - sent);
 
 			sent += ret;
 		}
@@ -199,6 +205,7 @@ void write(int fd, finfo_t& file, const char* buf, int nbytes)
 	}
 
 	lastfd = fd;
+	return sent;
 }
 
 //---------------------------------------------------------------------------
@@ -211,11 +218,11 @@ int trace(const char* fmt, ...)
 	va_list args;
 	va_start(args, fmt);
 
-	int nbytes1 = write(STDERR_FILENO, "trace: ", 7);
-	int nbytes2 = 0;
+	ssize_t nbytes1 = write(STDERR_FILENO, "trace: ", 7);
+	ssize_t nbytes2 = 0;
 
 	char* buf = nullptr;
-	int nbytes = vasprintf(&buf, fmt, args);
+	ssize_t nbytes = vasprintf(&buf, fmt, args);
 	if (nbytes != -1) {
 		std::unique_ptr<char, decltype(&free)> tmp(buf, free);
 
@@ -224,7 +231,7 @@ int trace(const char* fmt, ...)
 	}
 
 	va_end(args);
-	return nbytes1 + nbytes2;
+	return int(nbytes1 + nbytes2);
 }
 
 std::string flags_str(u_short flags)
@@ -269,17 +276,7 @@ std::string fflags_str(u_int fflags)
 
 //---------------------------------------------------------------------------
 //
-namespace
-{
-	bool s_stop = false;
-
-	void handle_signal(int)
-	{
-		s_stop = true;
-	}
-}
-
-void decode_events(fileinfo_t& files, int kq, int i, const struct kevent& tevent)
+void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& tevent)
 {
 	trace("event[%d]: ident:0x%lx flags:0x%hx (%s) fflags:0x%x (%s) data:0x%lx udata:%p\n",
 		i, tevent.ident,
@@ -293,7 +290,7 @@ void decode_events(fileinfo_t& files, int kq, int i, const struct kevent& tevent
 
 	// complete asynchronous read
 	if (tevent.udata) {
-		int fd{ static_cast<int>( reinterpret_cast<long>(tevent.udata) ) };
+		fd_t fd{ static_cast<fd_t>( reinterpret_cast<long>(tevent.udata) ) };
 		finfo_t& file = files.find(fd)->second;
 		struct aiocb* cb = reinterpret_cast<struct aiocb*>(tevent.ident);
 
@@ -309,14 +306,14 @@ void decode_events(fileinfo_t& files, int kq, int i, const struct kevent& tevent
 			return;
 		}
 
-		char* buf{ static_cast<char*>( const_cast<void*>(file.cb.aio_buf) ) };
+		const char* buf{ static_cast<char*>( const_cast<void*>(file.cb.aio_buf) ) };
 		trace("aio_return: offset=%ld nbytes=%d\n", file.offset, nbytes); 
 		write(STDOUT_FILENO, file, buf, nbytes);
 		return;
 	}
 
 	// initiate asynchronous read
-	int fd{ static_cast<int>(tevent.ident) };
+	fd_t fd{ static_cast<fd_t>(tevent.ident) };
 	fileinfo_t::iterator pfile = files.find(fd);
 	if (pfile == files.end()) {
 		trace("ERROR: fd lookup\n");
@@ -334,7 +331,7 @@ void decode_events(fileinfo_t& files, int kq, int i, const struct kevent& tevent
 
 	// add aio_read
 	int ret{  aio_read(file.fill_cb(fd, kq)) };
-	trace("aio_read(fd=%d offset=%ld nbytes=%d)=%d code=%d error=\"%s\"\n",
+	trace("aio_read(fd=%d offset=%ld nbytes=%ld)=%d code=%d error=\"%s\"\n",
 		fd, file.offset, file.bufsz, ret, errno, strerror(errno));
 	if (ret == 0)
 		return;
@@ -354,9 +351,8 @@ void decode_events(fileinfo_t& files, int kq, int i, const struct kevent& tevent
 
 	// fall back to synchronous read
 	char* buf{ static_cast<char*>(const_cast<void*>(file.cb.aio_buf)) };
-	int bufsz{ file.bufsz };
+	size_t bufsz{ file.bufsz };
 
-//	lseek(fd, file.offset, SEEK_SET);
 	assert(file.offset == lseek(fd, 0, SEEK_CUR));
 	int nbytes = read(fd, buf, bufsz);
 	if (nbytes == -1)
@@ -365,6 +361,16 @@ void decode_events(fileinfo_t& files, int kq, int i, const struct kevent& tevent
 		return;
 	trace("read: nbytes=%d\n", nbytes); 
 	write(STDOUT_FILENO, file, buf, nbytes);
+}
+
+namespace
+{
+	bool s_stop = false;
+
+	void handle_signal(int)
+	{
+		s_stop = true;
+	}
 }
 
 int main(int argc, char* argv[])
@@ -382,7 +388,7 @@ int main(int argc, char* argv[])
 	kevents_t events{ make_events(files) };
 	kevents_t tevents{ 2 * files.size()} ; // allow error and fired on each
 
-	int kq = kqueue();
+	kq_t kq = kqueue();
 	if (kq == -1)
 		err(EXIT_FAILURE, "kqueue(): code=%d error%s", errno, strerror(errno));
 
@@ -396,8 +402,7 @@ int main(int argc, char* argv[])
 		if (n_tevents == -1)
 			err(EXIT_FAILURE, "kevent failed code=%d error=\"%s\"", errno, strerror(errno));
 
-		for (int i = 0; i != n_tevents; ++i) {
+		for (int i = 0; i != n_tevents; ++i)
 			decode_events(files, kq, i, tevents[i]);
-		}
 	}
 }
