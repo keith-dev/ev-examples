@@ -4,6 +4,7 @@ MK_MAN   = no
 NO_OBJ   = noobj
 
 CXXFLAGS  = -g
-CXXFLAGS += -std=c++17 -Wall -Wextra
+CXXFLAGS += -std=c++17 -Wall -Wextra -Wno-unused-parameter -I/usr/local/include
+LDFLAGS  += -L/usr/local/lib -lev
 
 .include <bsd.prog.mk>
