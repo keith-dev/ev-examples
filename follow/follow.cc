@@ -6,6 +6,7 @@
 
 #include <sys/event.h>
 #include <sys/aio.h>
+#include <sys/uio.h>
 
 #include <fcntl.h>
 
@@ -290,31 +291,6 @@ kevents_t make_events(fileinfo_t& files)
 	return events;
 }
 
-ssize_t write(fd_t fd, finfo_t& file, const char* buf, size_t nbytes)
-{
-	static fd_t lastfd{-1};
-
-	ssize_t sent{};
-
-	if (nbytes > 0) {
-		if (lastfd != -1 && fd != lastfd)
-			write(fd, file.comment.get(), file.commentsz);
-		
-		while (static_cast<size_t>(sent) < nbytes) {
-			ssize_t ret = write(fd, buf, nbytes - sent);
-			if (unlikely(ret == -1))
-				err(EXIT_FAILURE, "write(%d, buf, %ld) failed", fd, nbytes - sent);
-
-			sent += ret;
-		}
-
-		file.offset += nbytes;
-	}
-
-	lastfd = fd;
-	return sent;
-}
-
 //---------------------------------------------------------------------------
 //
 int trace(const char* fmt, ...)
@@ -381,24 +357,51 @@ std::string fflags_str(u_int fflags)
 	return (str.size() > 3) ? str.substr(3) : std::string();
 }
 
-//------------------------------------------------------------/---------------
+//---------------------------------------------------------------------------
 //
-void on_read(finfo_t& file, const char* buf, int nbytes) {
+ssize_t write(fd_t fd, finfo_t& file, const char* buf, size_t nbytes)
+{
+	static fd_t lastfd{-1};
+
+	ssize_t sent{};
+
+	if (nbytes > 0) {
+		iovec bufs[2];
+		size_t nbufs{};
+
+		if (lastfd != -1 && fd != lastfd) {
+			bufs[nbufs].iov_base = file.comment.get();
+			bufs[nbufs].iov_len = file.commentsz;
+			++nbufs;
+		}
+		bufs[nbufs].iov_base = static_cast<void*>(const_cast<char*>(buf));
+		bufs[nbufs].iov_len = nbytes;
+		++nbufs;
+		
+		while (static_cast<size_t>(sent) < nbytes) {
+			ssize_t ret = pwritev(fd, bufs, nbufs, sent);
+			if (unlikely(ret == -1))
+				err(EXIT_FAILURE, "write(%d, buf, %ld) failed", fd, nbytes - sent);
+
+			sent += ret;
+		}
+
+		file.offset += nbytes;
+	}
+
+	lastfd = fd;
+	return sent;
+}
+
+void on_read(finfo_t& file, const char* buf, int nbytes)
+{
 	write(STDOUT_FILENO, file, buf, nbytes);
 }
 
-void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& tevent)
+//---------------------------------------------------------------------------
+//
+void decode_file_event(kq_t kq, fileinfo_t& files, int i, const struct kevent& tevent)
 {
-	trace("event[%d]: ident:0x%lx flags:0x%hx (%s) fflags:0x%x (%s) data:0x%lx udata:%p\n",
-		i, tevent.ident,
-		tevent.flags, flags_str(tevent.flags).c_str(),
-		tevent.fflags, fflags_str(tevent.fflags).c_str(),
-		tevent.data, tevent.udata);
-	if (tevent.flags & EV_ERROR) {
-		trace("ERROR\n");
-		err(EXIT_FAILURE, "ERROR: code=%d error=\"%s\"", errno, strerror(errno));
-	}
-
 	// complete asynchronous read
 	if (tevent.udata) {
 		fd_t fd{ static_cast<fd_t>( reinterpret_cast<long>(tevent.udata) ) };
@@ -419,7 +422,6 @@ void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& teven
 
 		const char* buf{ static_cast<char*>( const_cast<void*>(file.cb.aio_buf) ) };
 		trace("aio_return: offset=%ld nbytes=%d\n", file.offset, nbytes); 
-//		write(STDOUT_FILENO, file, buf, nbytes);
 		on_read(file, buf, nbytes);
 		return;
 	}
@@ -467,23 +469,43 @@ void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& teven
 	char* buf{ static_cast<char*>(const_cast<void*>(file.cb.aio_buf)) };
 	size_t bufsz{ file.bufsz };
 
-//	assert(file.offset == lseek(fd, 0, SEEK_CUR));
 	int nbytes = read(fd, buf, bufsz);
 	if (nbytes == -1)
 		err(EXIT_FAILURE, "read failed code=%d error=\"%s\"", errno, strerror(errno));
 	if (nbytes == 0)
 		return;
 	trace("read: nbytes=%d\n", nbytes); 
-//	write(STDOUT_FILENO, file, buf, nbytes);
 	on_read(file, buf, nbytes);
+}
+
+void decode_event(kq_t kq, fileinfo_t& files, int i, const struct kevent& tevent)
+{
+	trace("event[%d]: ident:0x%lx flags:0x%hx (%s) fflags:0x%x (%s) data:0x%lx udata:%p\n",
+		i, tevent.ident,
+		tevent.flags, flags_str(tevent.flags).c_str(),
+		tevent.fflags, fflags_str(tevent.fflags).c_str(),
+		tevent.data, tevent.udata);
+	if (tevent.flags & EV_ERROR) {
+		trace("ERROR\n");
+		err(EXIT_FAILURE, "ERROR: code=%d error=\"%s\"", errno, strerror(errno));
+	}
+
+	fd_t fd{ static_cast<fd_t>(tevent.ident) };
+	fileinfo_t::iterator pfile = files.find(fd);
+	if (pfile == files.end())
+		fd = static_cast<fd_t>( reinterpret_cast<long>(tevent.udata) );
+	finfo_t& file = pfile->second;
+
+	if (file.flags | EVFILT_VNODE) {
+		decode_file_event(kq, files, i, tevent);
+	}
 }
 
 namespace
 {
 	bool s_stop = false;
 
-	void handle_signal(int)
-	{
+	void handle_signal(int) {
 		s_stop = true;
 	}
 }
@@ -501,7 +523,7 @@ int main(int argc, char* argv[])
 		return 0;
 
 	kevents_t events{ make_events(files) };
-	kevents_t tevents{ 2 * files.size()} ; // allow error and fired on each
+	kevents_t tevents{ 2 * files.size() }; // allow error and fired on each
 
 	kq_t kq = kqueue();
 	if (kq == -1)
@@ -518,6 +540,6 @@ int main(int argc, char* argv[])
 			err(EXIT_FAILURE, "kevent failed code=%d error=\"%s\"", errno, strerror(errno));
 
 		for (int i = 0; i != n_tevents; ++i)
-			decode_events(files, kq, i, tevents[i]);
+			decode_event(kq, files, i, tevents[i]);
 	}
 }
