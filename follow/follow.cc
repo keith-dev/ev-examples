@@ -1,11 +1,17 @@
 #include <unistd.h>
 #include <sys/types.h>
-#include <sys/aio.h>
-#include <sys/event.h>
 #include <sys/errno.h>
 #include <err.h>
-#include <fcntl.h>
 #include <strings.h>
+
+#include <sys/event.h>
+#include <sys/aio.h>
+
+#include <fcntl.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <vector>
 #include <map>
@@ -29,6 +35,7 @@
 
 using fd_t = int;
 using kq_t = int;
+using kevents_t = std::vector<struct kevent>;
 
 int trace(const char* fmt, ...) __attribute__ ((format (printf, 1, 2)));
 
@@ -38,7 +45,7 @@ struct finfo_t
 {
 	finfo_t() = default;
 	~finfo_t() = default;
-	finfo_t(off_t offset, const char* name);
+	finfo_t(off_t offset, const char* name, u_short flags, u_int fflags, int64_t data);
 
 	finfo_t(finfo_t&& n);
 	finfo_t& operator=(finfo_t&& n) = delete;
@@ -57,6 +64,11 @@ struct finfo_t
 	size_t namelen{std::numeric_limits<size_t>::max()};
 	const char* name{nullptr};
 
+	// kevent flags
+	u_short flags{0};
+	u_int fflags{0};
+	int64_t data{0};
+
 	// prebuilt comment
 	int commentsz{-1};
 	std::unique_ptr<char, decltype(&free)> comment{nullptr, free};
@@ -70,14 +82,16 @@ struct finfo_t
 	std::unique_ptr<char, decltype(&free)> buf{nullptr, free};
 };
 using fileinfo_t = std::map<fd_t, finfo_t>;	// files by fd
-using kevents_t = std::vector<struct kevent>;
 
 #ifdef NDEBUG
 inline
 #endif
-finfo_t::finfo_t(off_t offset, const char* name) :
+finfo_t::finfo_t(off_t offset, const char* name, u_short flags, u_int fflags, int64_t data) :
 	// file info
 	offset(offset), namelen(strlen(name)), name(name),
+
+	// kevent options
+	flags(flags), fflags(fflags), data(data),
 
 	// asynchronous i/o
 #ifndef NDEBUG
@@ -105,6 +119,9 @@ finfo_t::finfo_t(finfo_t&& n) :
 	// file info
 	offset(n.offset), namelen(n.namelen), name(n.name),
 
+	// kevent options
+	flags(n.flags), fflags(n.fflags), data(n.data),
+
 	// prebuilt comment
 	commentsz(n.commentsz), comment(std::move(n.comment)),
 
@@ -114,8 +131,15 @@ finfo_t::finfo_t(finfo_t&& n) :
 #endif
 	cb(n.cb), buf(std::move(n.buf))
 {
+	n.offset	= 0;
+	n.namelen	= 0;
 	n.name		= nullptr;
-	n.offset	= -1;
+
+	n.flags		= 0;
+	n.fflags	= 0;
+	n.data		= 0;
+
+	n.commentsz	= 0;
 #ifndef NDEBUG
 	n.pending	= false;
 	invariant();
@@ -153,16 +177,99 @@ struct aiocb* finfo_t::fill_cb(fd_t fd, kq_t kq)
 
 //---------------------------------------------------------------------------
 //
+fd_t create_tcp4_server(const char* host, uint16_t port) {
+	in_addr addr_in;
+	int ret = inet_aton(host, &addr_in);
+	if (ret == -1)
+		return -1;
+
+	sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr = addr_in;
+	addr.sin_port = htons(port);
+
+	fd_t s = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == -1)
+		return -1;
+
+	ret = bind(s, (sockaddr*)&addr, sizeof(addr));
+	if (ret == -1) {
+		close(s);
+		return -1;
+	}
+
+	ret = listen(s, 128);
+	return s;
+}
+
+fd_t create_udp4_server(const char* host, uint16_t port) {
+	in_addr addr_in;
+	int ret = inet_aton(host, &addr_in);
+	if (ret == -1)
+		return -1;
+
+	sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr = addr_in;
+	addr.sin_port = htons(port);
+
+	fd_t s = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (s == -1)
+		return -1;
+
+	ret = bind(s, (sockaddr*)&addr, sizeof(addr));
+	if (ret == -1) {
+		close(s);
+		return -1;
+	}
+
+	return s;
+}
+
+std::tuple<fd_t, u_short, u_int, int64_t> factory(const char* name) {
+	if (strlen(name) > 4) {
+		if (const char* port = strrchr(name + 4, ':')) {
+			uint16_t nport = atoi(port + 1);
+			std::string addr(name + 4, port - name - 4);
+
+			if (strncmp(name, "udp:", 4) == 0)
+				return std::make_tuple(create_udp4_server(addr.c_str(), nport),
+										EVFILT_READ,
+										EV_ADD | EV_CLEAR,
+										0);
+			if (strncmp(name, "tcp:", 4) == 0)
+				return std::make_tuple(create_tcp4_server(addr.c_str(), nport),
+										EVFILT_READ,
+										EV_ADD | EV_CLEAR,
+										0);
+			return std::make_tuple(-1, 0, 0, 0);
+		}
+	}
+
+	return std::make_tuple(open(name, O_RDONLY),
+							EVFILT_VNODE,
+							EV_ADD | EV_CLEAR,
+							NOTE_WRITE);
+}
+
 fileinfo_t make_fileinfo(int argc, char* argv[])
 {
 	fileinfo_t files;
 
 	for (int i = 1; i < argc; ++i) {
-		fd_t fd = open(argv[i], O_RDONLY);
+		auto [fd, flags, fflags, data] = factory(argv[i]);
 		if (fd == -1)
 			err(EXIT_FAILURE, "cannot open: %s", argv[i]);
 
-		files.emplace(fd, finfo_t(lseek(fd, 0, SEEK_END), argv[i]));
+		off_t offset{};
+		if (data) {
+			offset = lseek(fd, 0, SEEK_END);
+			if (offset == -1)
+				offset = 0;
+		}
+		files.emplace(fd, finfo_t(offset, argv[i], flags, fflags, data));
 	}
 
 	return files;
@@ -177,7 +284,7 @@ kevents_t make_events(fileinfo_t& files)
 
 	for (; p != files.end(); ++p, ++i) {
 		fd_t fd = p->first;
-		EV_SET(&events[i], fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_WRITE, 0, NULL);
+		EV_SET(&events[i], fd, p->second.flags, p->second.fflags, p->second.data, 0, NULL);
 	}
 
 	return events;
@@ -274,8 +381,12 @@ std::string fflags_str(u_int fflags)
 	return (str.size() > 3) ? str.substr(3) : std::string();
 }
 
-//---------------------------------------------------------------------------
+//------------------------------------------------------------/---------------
 //
+void on_read(finfo_t& file, const char* buf, int nbytes) {
+	write(STDOUT_FILENO, file, buf, nbytes);
+}
+
 void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& tevent)
 {
 	trace("event[%d]: ident:0x%lx flags:0x%hx (%s) fflags:0x%x (%s) data:0x%lx udata:%p\n",
@@ -308,7 +419,8 @@ void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& teven
 
 		const char* buf{ static_cast<char*>( const_cast<void*>(file.cb.aio_buf) ) };
 		trace("aio_return: offset=%ld nbytes=%d\n", file.offset, nbytes); 
-		write(STDOUT_FILENO, file, buf, nbytes);
+//		write(STDOUT_FILENO, file, buf, nbytes);
+		on_read(file, buf, nbytes);
 		return;
 	}
 
@@ -330,12 +442,13 @@ void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& teven
 #endif
 
 	// add aio_read
-	int ret{  aio_read(file.fill_cb(fd, kq)) };
+	int ret{ aio_read(file.fill_cb(fd, kq)) };
 	trace("aio_read(fd=%d offset=%ld nbytes=%ld)=%d code=%d error=\"%s\"\n",
 		fd, file.offset, file.bufsz, ret, errno, strerror(errno));
 	if (ret == 0)
-		return;
+		return; // async read request accepted
 
+	// async read request failed
 	ret = aio_cancel(fd, &file.cb);
 	trace("aio_cancel() code=%d text=%s\n", ret,
 		(ret == AIO_CANCELED    ? "AIO_CANCELED" :
@@ -344,23 +457,25 @@ void decode_events(fileinfo_t& files, kq_t kq, int i, const struct kevent& teven
 #ifndef NDEBUG
 	file.pending = false;
 #endif
-	if (ret == AIO_CANCELED) {
-		trace("falling back to synchronous read\n");
+	if (ret == AIO_ALLDONE) {
+		trace("asynchronous read request has completed\n");
 		return;
 	}
 
 	// fall back to synchronous read
+	trace("falling back to synchronous read\n");
 	char* buf{ static_cast<char*>(const_cast<void*>(file.cb.aio_buf)) };
 	size_t bufsz{ file.bufsz };
 
-	assert(file.offset == lseek(fd, 0, SEEK_CUR));
+//	assert(file.offset == lseek(fd, 0, SEEK_CUR));
 	int nbytes = read(fd, buf, bufsz);
 	if (nbytes == -1)
 		err(EXIT_FAILURE, "read failed code=%d error=\"%s\"", errno, strerror(errno));
 	if (nbytes == 0)
 		return;
 	trace("read: nbytes=%d\n", nbytes); 
-	write(STDOUT_FILENO, file, buf, nbytes);
+//	write(STDOUT_FILENO, file, buf, nbytes);
+	on_read(file, buf, nbytes);
 }
 
 namespace

@@ -3,7 +3,8 @@ SRCS     = follow.cc
 MK_MAN   = no
 NO_OBJ   = noobj
 
-CXXFLAGS  = -g -O3 -DNDEBUG=1
-CXXFLAGS += -std=c++17 -Wall -Wextra
+CXXFLAGS  = -g
+#CXXFLAGS += -O3 -DNDEBUG=1
+CXXFLAGS += -std=c++17 -Wall -Wextra -Wno-unused-parameter
 
 .include <bsd.prog.mk>
